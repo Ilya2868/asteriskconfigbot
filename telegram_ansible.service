@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Ansible Bot
+After=network.target
+
+[Service]
+ExecStart=/opt/ansiblebot/venv/bin/python3 /opt/ansiblebot/telegram_ansible_bot.py
+#WorkingDirectory=/opt/ansiblebot/
+Restart=always
+User=root
+Group=root
+
+#Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

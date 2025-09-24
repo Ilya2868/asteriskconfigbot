@@ -1,0 +1,130 @@
+#!/bin/bash
+
+NUMBER=$1
+TRUNK=$2
+TYPE=$3
+
+# Функция для проверки существования номера
+check_number_exists() {
+    local num=$1
+#    grep -o "$num" /etc/asterisk/extensions_mtt.conf
+#    grep -o "$num" /etc/asterisk/extensions_mts.conf
+#    grep -o "$num" /etc/asterisk/extensions_transit.conf
+#    grep -o "$num" /etc/asterisk/extensions_out.conf
+
+       grep -o "exten => _${num}\s*" /etc/asterisk/extensions_mtt.conf
+       grep -o "exten => _${num}\s*" /etc/asterisk/extensions_mts.conf
+       grep -o "exten => _${num}\s*" /etc/asterisk/extensions_transit.conf
+       grep -o "exten => _${num}\s*" /etc/asterisk/extensions_out.conf
+
+}
+
+# Функция для добавления исходящего маршрута
+add_out_number() {
+    local num=$1
+    local trunk=$2
+    echo -e "\nДобавляем $num в out"
+    echo >> /etc/asterisk/extensions_out.conf "exten => _$num,1,Dial(PJSIP/\${EXTEN}@$trunk,60) ;$num - $trunk"
+    echo -e >> /etc/asterisk/extensions_out.conf "exten => _$num,n,Hangup()\n"
+
+}
+
+# Функция для добавления номера mts
+add_mts_number() {
+    local num=$1
+    echo -e "\nДобавляем $num в mts"
+    echo >> /etc/asterisk/extensions_mts.conf "exten => _$num,1,DumpChan()"
+    echo >> /etc/asterisk/extensions_mts.conf "exten => _$num,n,Set(CALLERID(number)=7\${CALLERID(num):1})"
+    echo >> /etc/asterisk/extensions_mts.conf "exten => _$num,n,Dial(PJSIP/101,60)"
+    echo -e >> /etc/asterisk/extensions_mts.conf "exten => _$num,n,Hangup()\n"
+
+}
+
+# Функция для добавления номера mtt
+add_mtt_number() {
+    local num=$1
+    echo -e "\nДобавляем $num в mtt"
+    echo >> /etc/asterisk/extensions_mtt.conf "exten => _$num,1,DumpChan()"
+    echo >> /etc/asterisk/extensions_mtt.conf "exten => _$num,n,Set(CALLERID(number)=7\${CALLERID(num):1})"
+    echo >> /etc/asterisk/extensions_mtt.conf "exten => _$num,n,Queue(102,m,,,60)"
+    echo -e >> /etc/asterisk/extensions_mtt.conf "exten => _$num,n,Hangup()\n"
+
+}
+
+
+
+# Функция для добавления номера transit
+add_transit_number() {
+    local num=$1
+    echo -e "\nДобавляем $num в transit"
+    echo >> /etc/asterisk/extensions_transit.conf "exten => _$num,1,DumpChan()"
+    echo >> /etc/asterisk/extensions_transit.conf "exten => _$num,n,Set(CALLERID(number)=7\${CALLERID(num):1})"
+    echo -e >> /etc/asterisk/extensions_transit.conf "exten => _$num,n,Dial(PJSIP/\${EXTEN}@astertest,60)\n"
+}
+
+
+
+# Функция для удаления номера
+remove_number() {
+    local num=$1
+    sed -i "/$num/d" "/etc/asterisk/extensions_mtt.conf"
+    sed -i "/$num/d" "/etc/asterisk/extensions_mts.conf"
+    sed -i "/$num/d" "/etc/asterisk/extensions_transit.conf"
+    sed -i "/$num/d" "/etc/asterisk/extensions_out.conf"
+    echo -e "Номер или маршрут $num удалён"
+}
+
+# Обработка команды help
+if [[ "$NUMBER" = "help" ]]; then
+    echo -e "\nДОБАВЛЯЮТСЯ НОМЕРА ФОРМАТА 7XXXXXXXXXX и 342ХХХХ!\n" 
+    echo -e "Для добавления номера в mtt:\nУказывается номер, или несколько номеров, ключ \"mtt\": \"/rt_many 74953151234,7495 mtt \"\n"
+    echo -e "Для добавления номера в mts:\nУказывается номер, или несколько номеров, ключ \"mts\": \"/rt_many 74953151234 mts\"\n"
+    echo -e "Для добавления номера в transit:\nУказывается номер,  или несколько номеров, ключ \"transit\": \"/rt_many 74953151234 transit\"\n"
+    echo -e "Для добавления номера в out:\nУказывается номер, или несколько номеров, ключ \"out\" и название транка mtt или mts: \"/rt_many 74953151234 out mtt\"\n"
+    echo -e "Для удаления номера:\nУказывается номер, или несколько номеров, ключ \"remove\":  \"/rt_many 74953151234,123 remove\"\n"
+    exit 0
+fi
+
+# Разделение номеров по запятой
+IFS=',' read -ra NUMBERS <<< "$NUMBER"
+
+# Обработка каждого номера
+for num in "${NUMBERS[@]}"; do
+    # Удаляем возможные пробелы вокруг номера
+    num=$(echo "$num" | xargs)
+
+    # Проверяем существует ли номер
+    READ=$(check_number_exists "$num")
+
+    if [[ "$TRUNK" = "remove" ]]; then
+        if [[ -n "$READ" ]]; then
+            remove_number "$num"
+        else
+            echo -e "\nНомер $num не найден. Нечего удалять."
+        fi
+    else
+        if [[ -z "$READ" ]]; then
+            case "$TRUNK" in
+                "out")
+                    if [[ -n "$TYPE" ]]; then
+                        add_out_number "$num" "$TYPE"
+                    else
+                        echo -e "\nДля добавления в исходящие необходимо указать направление"
+                    fi
+                    ;;
+                "mts") add_mts_number "$num" ;;
+                "mtt") add_mtt_number "$num" ;;
+                "transit") add_transit_number "$num" ;;
+                *) echo -e "\nНеизвестный тип: $TRUNK" ;;
+            esac
+        else
+            echo -e "\nНомер $num уже существует в конфигурации"
+        fi
+    fi
+done
+
+# Перезагрузка dialplan только если были изменения
+if [[ "${#NUMBERS[@]}" -gt 0 ]] && [[ "$TYPE" != "help" ]]; then
+    asterisk -rx "dialplan reload"
+    echo -e "\nDialplan перезагружен"
+fi
