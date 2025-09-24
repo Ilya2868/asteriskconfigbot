@@ -14,14 +14,21 @@ cd /opt/ansiblebot
 папку venv можно удалить
 
 python3 -m venv venv
+
 source venv/bin/activate
+
 pip install --upgrade pip
+
 pip install python-telegram-bot ansible python-dotenv
+
 touch .env
+
 echo 'BOT_TOKEN=ваш_телеграм_токен' > .env
+
 chmod 600 .env
 
 можно запустить вручную чтобы проверить все ли установилось
+
 ./venv/bin/python telegram_ansible_bot.py
 
 
