@@ -18,7 +18,14 @@ IP-транк без регистрации:
 Пример без регистрации:
   pjsip_trunk_upsert provider-ip 203.0.113.20 from-provider-ip
 
+Удаление транка любого типа:
+  pjsip_trunk_upsert ИМЯ_ТРАНКА remove
+
+Пример удаления:
+  pjsip_trunk_upsert provider1 remove
+
 Скрипт добавляет новый транк или полностью обновляет ранее созданный блок.
+При удалении скрипт удаляет весь управляемый блок транка со всеми его секциями.
 USAGE
 }
 
@@ -32,7 +39,7 @@ die() {
     exit 0
 }
 
-[[ $# -eq 3 || $# -eq 5 ]] || {
+[[ $# -eq 2 || $# -eq 3 || $# -eq 5 ]] || {
     usage >&2
     exit 2
 }
@@ -40,26 +47,39 @@ die() {
 [[ ${EUID} -eq 0 ]] || die "скрипт должен запускаться от root"
 
 trunk="$1"
-host="$2"
 
-if [[ $# -eq 5 ]]; then
+if [[ $# -eq 2 && "$2" == "remove" ]]; then
+    trunk_mode="remove"
+    host=""
+    username=""
+    password=""
+    context=""
+elif [[ $# -eq 5 ]]; then
     trunk_mode="registration"
+    host="$2"
     username="$3"
     password="$4"
     context="$5"
-else
+elif [[ $# -eq 3 ]]; then
     trunk_mode="ip"
+    host="$2"
     username=""
     password=""
     context="$3"
+else
+    usage >&2
+    exit 2
 fi
 
 [[ "$trunk" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || \
     die "имя транка: только латинские буквы, цифры, _ и -"
-[[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?$ ]] || \
-    die "хост должен быть IPv4/DNS-именем с необязательным портом"
-[[ "$context" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || \
-    die "недопустимый контекст"
+
+if [[ "$trunk_mode" != "remove" ]]; then
+    [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?$ ]] || \
+        die "хост должен быть IPv4/DNS-именем с необязательным портом"
+    [[ "$context" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || \
+        die "недопустимый контекст"
+fi
 
 if [[ "$trunk_mode" == "registration" ]]; then
     [[ "$username" =~ ^[A-Za-z0-9][A-Za-z0-9_.+@-]{0,127}$ ]] || \
@@ -83,6 +103,9 @@ start_count=$(grep -Fxc "$start_marker" "$PJSIP_CONF" || true)
 end_count=$(grep -Fxc "$end_marker" "$PJSIP_CONF" || true)
 [[ "$start_count" -eq "$end_count" && "$start_count" -le 1 ]] || \
     die "повреждены маркеры управляемого блока $trunk"
+if [[ "$trunk_mode" == "remove" && "$start_count" -eq 0 ]]; then
+    die "управляемый транк $trunk не найден"
+fi
 
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 backup="${PJSIP_CONF}.bak.${stamp}"
@@ -96,9 +119,8 @@ awk -v start="$start_marker" -v end="$end_marker" '
     !skipping   { print }
 ' "$PJSIP_CONF" > "$tmp"
 
-host_without_port="${host%%:*}"
-
 if [[ "$trunk_mode" == "registration" ]]; then
+    host_without_port="${host%%:*}"
     cat >> "$tmp" <<EOF
 
 $start_marker
@@ -146,7 +168,8 @@ line=yes
 endpoint=$trunk
 $end_marker
 EOF
-else
+elif [[ "$trunk_mode" == "ip" ]]; then
+    host_without_port="${host%%:*}"
     cat >> "$tmp" <<EOF
 
 $start_marker
@@ -181,18 +204,33 @@ file_mode=$(stat -c '%a' "$PJSIP_CONF")
 install -o "${owner%:*}" -g "${owner#*:}" -m "$file_mode" "$tmp" "$PJSIP_CONF"
 
 if systemctl is-active --quiet asterisk; then
-    if ! asterisk -rx "pjsip reload" >/dev/null 2>&1 || \
-       ! asterisk -rx "pjsip show endpoint $trunk" 2>/dev/null | grep -q 'Endpoint:'; then
+    validation_failed=false
+    if ! asterisk -rx "pjsip reload" >/dev/null 2>&1; then
+        validation_failed=true
+    elif ! endpoint_output=$(asterisk -rx "pjsip show endpoint $trunk" 2>/dev/null); then
+        validation_failed=true
+    elif [[ "$trunk_mode" == "remove" && "$endpoint_output" == *"Endpoint:"* ]]; then
+        validation_failed=true
+    elif [[ "$trunk_mode" != "remove" && "$endpoint_output" != *"Endpoint:"* ]]; then
+        validation_failed=true
+    fi
+
+    if [[ "$validation_failed" == true ]]; then
         cp -a "$backup" "$PJSIP_CONF"
         asterisk -rx "pjsip reload" >/dev/null 2>&1 || true
         die "PJSIP не принял конфигурацию; восстановлена копия $backup"
     fi
 fi
 
-if [[ "$trunk_mode" == "registration" ]]; then
-    description="с регистрацией"
+if [[ "$trunk_mode" == "remove" ]]; then
+    printf 'Транк %s удалён со всеми управляемыми секциями. Резервная копия: %s\n' \
+        "$trunk" "$backup"
 else
-    description="без регистрации"
+    if [[ "$trunk_mode" == "registration" ]]; then
+        description="с регистрацией"
+    else
+        description="без регистрации"
+    fi
+    printf 'Транк %s (%s) добавлен/обновлён. Резервная копия: %s\n' \
+        "$trunk" "$description" "$backup"
 fi
-printf 'Транк %s (%s) добавлен/обновлён. Резервная копия: %s\n' \
-    "$trunk" "$description" "$backup"

@@ -40,7 +40,8 @@ PJSIP_SCRIPT = BASE_DIR / "pjsip_trunk_upsert"
     DELETE_ARGS,
     ADD_TRUNK_ARGS,
     ADD_IP_TRUNK_ARGS,
-) = range(6)
+    DELETE_TRUNK_ARGS,
+) = range(7)
 
 
 def build_ipv6_request() -> HTTPXRequest:
@@ -103,6 +104,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         ["Добавить транк с регистрацией"],
         ["Добавить транк без регистрации"],
+        ["Удалить транк"],
         ["Добавить входящий номер"],
         ["Добавить исходящий маршрут"],
         ["Удалить номер или маршрут"],
@@ -132,6 +134,12 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Пример: provider-ip 203.0.113.20 from-provider-ip"
         )
         return ADD_IP_TRUNK_ARGS
+    if text == "Удалить транк":
+        await update.effective_message.reply_text(
+            "Введите 2 аргумента: имя_транка remove\n"
+            "Пример: provider1 remove"
+        )
+        return DELETE_TRUNK_ARGS
     if text == "Добавить входящий номер":
         await update.effective_message.reply_text(
             "Введите номер и направление.\n"
@@ -152,6 +160,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             "PJSIP с регистрацией: имя_транка хост логин пароль контекст\n"
             "PJSIP без регистрации: имя_транка хост контекст\n\n"
+            "Удаление PJSIP-транка: имя_транка remove\n\n"
             f"{output}"
         )
         return await start(update, context)
@@ -228,6 +237,25 @@ async def add_ip_trunk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await start(update, context)
 
 
+async def delete_trunk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await reject_if_needed(update):
+        return ConversationHandler.END
+    try:
+        args = shlex.split(update.effective_message.text)
+    except ValueError as exc:
+        await update.effective_message.reply_text(f"Ошибка в кавычках: {exc}")
+        return DELETE_TRUNK_ARGS
+    if len(args) != 2 or args[1] != "remove":
+        await update.effective_message.reply_text(
+            "Нужно ровно 2 аргумента: имя_транка remove"
+        )
+        return DELETE_TRUNK_ARGS
+
+    output = run_script(PJSIP_SCRIPT, args)
+    await update.effective_message.reply_text(f"Результат:\n{output}")
+    return await start(update, context)
+
+
 def main() -> None:
     app = (
         ApplicationBuilder()
@@ -245,6 +273,7 @@ def main() -> None:
             DELETE_ARGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_route)],
             ADD_TRUNK_ARGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_trunk)],
             ADD_IP_TRUNK_ARGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_ip_trunk)],
+            DELETE_TRUNK_ARGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_trunk)],
         },
         fallbacks=[CommandHandler("start", start)],
     )
