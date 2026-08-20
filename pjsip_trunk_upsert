@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PJSIP_CONF="${PJSIP_CONF:-/etc/asterisk/pjsip.conf}"
+LOCK_FILE="${LOCK_FILE:-/run/lock/asteriskconfigbot-pjsip.lock}"
+
+usage() {
+    cat <<'USAGE'
+Транк с регистрацией:
+  pjsip_trunk_upsert ИМЯ_ТРАНКА ХОСТ ЛОГИН ПАРОЛЬ КОНТЕКСТ
+
+Пример с регистрацией:
+  pjsip_trunk_upsert provider1 203.0.113.10 sip-login 'sip-password' from-provider1
+
+IP-транк без регистрации:
+  pjsip_trunk_upsert ИМЯ_ТРАНКА ХОСТ КОНТЕКСТ
+
+Пример без регистрации:
+  pjsip_trunk_upsert provider-ip 203.0.113.20 from-provider-ip
+
+Скрипт добавляет новый транк или полностью обновляет ранее созданный блок.
+USAGE
+}
+
+die() {
+    printf 'Ошибка: %s\n' "$*" >&2
+    exit 1
+}
+
+[[ "${1:-}" != "help" && "${1:-}" != "--help" && "${1:-}" != "-h" ]] || {
+    usage
+    exit 0
+}
+
+[[ $# -eq 3 || $# -eq 5 ]] || {
+    usage >&2
+    exit 2
+}
+
+[[ ${EUID} -eq 0 ]] || die "скрипт должен запускаться от root"
+
+trunk="$1"
+host="$2"
+
+if [[ $# -eq 5 ]]; then
+    trunk_mode="registration"
+    username="$3"
+    password="$4"
+    context="$5"
+else
+    trunk_mode="ip"
+    username=""
+    password=""
+    context="$3"
+fi
+
+[[ "$trunk" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || \
+    die "имя транка: только латинские буквы, цифры, _ и -"
+[[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?$ ]] || \
+    die "хост должен быть IPv4/DNS-именем с необязательным портом"
+[[ "$context" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || \
+    die "недопустимый контекст"
+
+if [[ "$trunk_mode" == "registration" ]]; then
+    [[ "$username" =~ ^[A-Za-z0-9][A-Za-z0-9_.+@-]{0,127}$ ]] || \
+        die "недопустимый SIP-логин"
+    [[ -n "$password" && ${#password} -le 256 ]] || die "пароль пустой или слишком длинный"
+    [[ "$password" != *$'\n'* && "$password" != *$'\r'* && "$password" != *';'* ]] || \
+        die "пароль не должен содержать перевод строки или ;"
+fi
+
+[[ -f "$PJSIP_CONF" ]] || die "файл $PJSIP_CONF не найден"
+command -v flock >/dev/null || die "команда flock не найдена"
+
+umask 077
+install -d -m 0755 "$(dirname "$LOCK_FILE")"
+exec 9>"$LOCK_FILE"
+flock -x 9
+
+start_marker="; BEGIN ASTERISKCONFIGBOT:${trunk}"
+end_marker="; END ASTERISKCONFIGBOT:${trunk}"
+start_count=$(grep -Fxc "$start_marker" "$PJSIP_CONF" || true)
+end_count=$(grep -Fxc "$end_marker" "$PJSIP_CONF" || true)
+[[ "$start_count" -eq "$end_count" && "$start_count" -le 1 ]] || \
+    die "повреждены маркеры управляемого блока $trunk"
+
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+backup="${PJSIP_CONF}.bak.${stamp}"
+tmp=$(mktemp "${PJSIP_CONF}.tmp.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+cp -a "$PJSIP_CONF" "$backup"
+
+awk -v start="$start_marker" -v end="$end_marker" '
+    $0 == start { skipping = 1; next }
+    $0 == end   { skipping = 0; next }
+    !skipping   { print }
+' "$PJSIP_CONF" > "$tmp"
+
+host_without_port="${host%%:*}"
+
+if [[ "$trunk_mode" == "registration" ]]; then
+    cat >> "$tmp" <<EOF
+
+$start_marker
+[$trunk-auth]
+type=auth
+auth_type=userpass
+username=$username
+password=$password
+
+[$trunk-aor]
+type=aor
+contact=sip:$host
+qualify_frequency=60
+
+[$trunk]
+type=endpoint
+transport=transport-udp
+context=$context
+disallow=all
+allow=alaw,ulaw
+outbound_auth=$trunk-auth
+aors=$trunk-aor
+from_user=$username
+from_domain=$host_without_port
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+
+[$trunk-identify]
+type=identify
+endpoint=$trunk
+match=$host_without_port
+
+[$trunk-registration]
+type=registration
+transport=transport-udp
+outbound_auth=$trunk-auth
+server_uri=sip:$host
+client_uri=sip:$username@$host
+retry_interval=60
+forbidden_retry_interval=600
+expiration=3600
+line=yes
+endpoint=$trunk
+$end_marker
+EOF
+else
+    cat >> "$tmp" <<EOF
+
+$start_marker
+[$trunk-aor]
+type=aor
+contact=sip:$host
+qualify_frequency=60
+
+[$trunk]
+type=endpoint
+transport=transport-udp
+context=$context
+disallow=all
+allow=alaw,ulaw
+aors=$trunk-aor
+from_domain=$host_without_port
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+
+[$trunk-identify]
+type=identify
+endpoint=$trunk
+match=$host_without_port
+$end_marker
+EOF
+fi
+
+owner=$(stat -c '%u:%g' "$PJSIP_CONF")
+file_mode=$(stat -c '%a' "$PJSIP_CONF")
+install -o "${owner%:*}" -g "${owner#*:}" -m "$file_mode" "$tmp" "$PJSIP_CONF"
+
+if systemctl is-active --quiet asterisk; then
+    if ! asterisk -rx "pjsip reload" >/dev/null 2>&1 || \
+       ! asterisk -rx "pjsip show endpoint $trunk" 2>/dev/null | grep -q 'Endpoint:'; then
+        cp -a "$backup" "$PJSIP_CONF"
+        asterisk -rx "pjsip reload" >/dev/null 2>&1 || true
+        die "PJSIP не принял конфигурацию; восстановлена копия $backup"
+    fi
+fi
+
+if [[ "$trunk_mode" == "registration" ]]; then
+    description="с регистрацией"
+else
+    description="без регистрации"
+fi
+printf 'Транк %s (%s) добавлен/обновлён. Резервная копия: %s\n' \
+    "$trunk" "$description" "$backup"
